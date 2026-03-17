@@ -14,9 +14,10 @@ graph LR
     Arena["arena.ai API"]
 
     Client -- "OpenAI 格式请求<br/>POST /v1/chat/completions" --> Server
-    Ext -- "定时推送 token / cookies / models<br/>POST /v1/extension/push" --> Server
-    Server -- "arena.ai 格式请求<br/>携带真实 token + cookies" --> Arena
-    Arena -- "SSE 流式响应<br/>(a0: / ag: / ad: 前缀)" --> Server
+    Ext -- "定时推送 cookies / models<br/>POST /v1/extension/push" --> Server
+    Server -- "任务入队<br/>GET /v1/extension/fetch" --> Ext
+    Ext -- "浏览器内 fetch 转发<br/>(携带真实 cookies + reCAPTCHA)" --> Arena
+    Ext -- "SSE 数据块回传<br/>POST /v1/extension/fetch_chunk" --> Server
     Server -- "OpenAI SSE 格式<br/>data: {choices: [...]}" --> Client
 ```
 
@@ -30,6 +31,7 @@ sequenceDiagram
     participant C as content.js<br/>(ISOLATED World)
     participant B as background.js<br/>(Service Worker)
     participant S as Python Server
+    participant A as arena.ai API
 
     Note over I: 页面加载完成
     I->>I: 提取 models (Next.js 数据)
@@ -39,13 +41,13 @@ sequenceDiagram
     B->>B: 合并 cookies + 存储 models
     B->>S: POST /v1/extension/push
 
-    Note over B: 每 80s 请求新 token
-    B->>C: sendMessage({type: NEED_TOKEN})
-    C->>I: window.postMessage({type: GET_TOKEN})
-    I->>I: grecaptcha.enterprise.execute(SITEKEY)
-    I->>C: window.postMessage({type: TOKEN_OK, token})
-    C->>B: sendMessage({type: NEW_TOKEN, token})
-    B->>S: POST /v1/extension/push
+    Note over B: 每 500ms 轮询任务队列
+    B->>S: GET /v1/extension/fetch
+    S-->>B: {task_id, url, payload, headers}
+    B->>A: fetch(arena.ai, payload) — 浏览器内发出
+    A-->>B: SSE 流式响应
+    B->>S: POST /v1/extension/fetch_chunk × N
+    B->>S: POST /v1/extension/fetch_chunk (done=true)
 ```
 
 ### 请求处理流程
@@ -63,38 +65,53 @@ flowchart TD
     C -- 是 --> D["构建 arena.ai 请求体"]
     D --> E["生成 UUIDv7 (eval_id)"]
     E --> F["拼接多轮对话历史"]
-    F --> G["从 token 池弹出 reCAPTCHA V3 token"]
-    G --> H["组装 headers<br/>(cookies + auth + UA)"]
-    H --> I["POST arena.ai/nextjs-api/stream/create-evaluation"]
-    I --> J{stream 参数?}
-    J -- true --> K["逐行解析 SSE → 转换为 OpenAI chunk 格式"]
-    J -- false --> L["累积全部内容 → 返回完整 OpenAI 响应"]
+    F --> G["任务入队 RequestQueue"]
+    G --> H["等待扩展轮询并转发"]
+    H --> I["扩展用浏览器 fetch 发送到 arena.ai"]
+    I --> J["扩展逐块回传 SSE 数据"]
+    J --> K{stream 参数?}
+    K -- true --> L["逐行解析 SSE → 转换为 OpenAI chunk 格式"]
+    K -- false --> M["累积全部内容 → 返回完整 OpenAI 响应"]
 ```
 
 ### 关键技术点
 
-| 技术点 | 说明 |
-|-------|------|
-| **reCAPTCHA V3 绕过** | 扩展在真实浏览器环境中调用 `grecaptcha.enterprise.execute()`，获得高评分 token（有效期 ~2 分钟） |
-| **双 World 注入** | `injector.js` 运行在 MAIN world 可访问页面全局变量（grecaptcha、Next.js 数据）；`content.js` 运行在 ISOLATED world 可访问 Chrome API |
-| **Cookie 分片处理** | arena.ai 的 auth cookie 可能被分片存储为 `arena-auth-prod-v1.0` + `arena-auth-prod-v1.1`，服务器自动拼接 |
-| **Token 池管理** | 维护最多 10 个 V3 token 的滚动池，每 80 秒自动补充，过期 token (>120s) 自动清理 |
-| **SSE 协议转换** | arena.ai 使用自定义前缀（`a0:` 文本、`ag:` 推理、`ad:` 完成、`a2:` 心跳/图片、`a3:` 错误），服务器转换为标准 OpenAI SSE 格式 |
-| **模型自动发现** | 从 Next.js 的 `__NEXT_DATA__` 或 `__next_f` 中提取 `initialModels`，自动分类 text / image / vision 模型 |
+| 技术点             | 说明                                                                                                           |
+| --------------- | ------------------------------------------------------------------------------------------------------------ |
+| **浏览器内转发**      | 所有请求由扩展的 background.js 用浏览器原生 `fetch` 发出，携带真实浏览器 TLS 指纹、cookies 和 reCAPTCHA 上下文，完全绕过 Cloudflare Bot 检测       |
+| **任务队列轮询**      | Python 服务器将请求放入内存队列，扩展每 500ms 轮询 `/v1/extension/fetch` 取任务，完成后逐块通过 `/v1/extension/fetch_chunk` 回传 SSE 数据     |
+| **双 World 注入**  | `injector.js` 运行在 MAIN world 可访问页面全局变量（grecaptcha、Next.js 数据）；`content.js` 运行在 ISOLATED world 可访问 Chrome API |
+| **Cookie 分片处理** | arena.ai 的 auth cookie 可能被分片存储为 `arena-auth-prod-v1.0` + `arena-auth-prod-v1.1`，服务器自动拼接                      |
+| **SSE 协议转换**    | arena.ai 使用自定义前缀（`a0:` 文本、`ag:` 推理、`ad:` 完成、`a2:` 心跳/图片、`a3:` 错误），服务器转换为标准 OpenAI SSE 格式                     |
+| **模型自动发现**      | 从 Next.js 的 `__NEXT_DATA__` 或 `__next_f` 中提取 `initialModels`，自动分类 text / image / vision 模型                   |
 
 ## 快速开始
 
 ### 前置要求
 
-- Python 3.8+
+- Python 3.10+
 - Chrome 或 Firefox 浏览器
 - 一个 [arena.ai](https://arena.ai) 账号（免费注册）
+- macOS 用户需额外安装系统依赖：`brew install libidn2 rtmpdump`
 
 ### Step 1: 启动服务器
 
 ```bash
-pip install -r requirements.txt
-python server.py
+# 创建虚拟环境
+uv venv .venv --python python3.10
+source .venv/bin/activate
+
+# macOS 系统依赖
+brew install libidn2 rtmpdump
+
+# 安装 Python 依赖
+uv pip install curl-cffi fastapi uvicorn
+
+# 启动服务
+uv run python server.py
+
+DEBUG=1 uv run python server.py
+
 ```
 
 服务器默认监听 `http://localhost:9090`，启动后会等待扩展连接。
@@ -130,22 +147,30 @@ python server.py
 # 查看所有可用模型
 curl http://localhost:9090/v1/models
 
+curl -s http://localhost:9090/v1/models | python3 -c "import json,sys; [print(m['id']) for m in json.load(sys.stdin)['data'] if 'claude' in m['id'].lower()]"
+
+
 # 非流式聊天
 curl http://localhost:9090/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "GPT-4o",
-    "messages": [{"role": "user", "content": "Hello!"}]
+    "model": "claude-sonnet-4-6",
+    "messages": [{"role": "user", "content": "用python写一个排序算法"}]
   }'
 
 # 流式聊天
 curl http://localhost:9090/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
-    "model": "Claude 3.5 Sonnet",
+    "model": "gemini-3.1-pro",
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
   }'
+
+curl http://localhost:9090/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"Hello!"}],"stream":true}'
+
 ```
 
 ### 在 OpenAI SDK 中使用
@@ -186,23 +211,25 @@ for chunk in response:
 
 ## API 端点
 
-| 端点 | 方法 | 说明 |
-|------|------|------|
-| `/v1/models` | GET | 列出所有可用模型（OpenAI 格式） |
-| `/v1/chat/completions` | POST | 聊天补全，支持 `stream: true/false` |
-| `/v1/extension/push` | POST | 扩展推送 token/cookies/models（内部使用） |
-| `/v1/extension/status` | GET | 查看扩展连接状态和 token 池信息 |
-| `/health` | GET | 健康检查 |
+| 端点                          | 方法   | 说明                           |
+| --------------------------- | ---- | ---------------------------- |
+| `/v1/models`                | GET  | 列出所有可用模型（OpenAI 格式）          |
+| `/v1/chat/completions`      | POST | 聊天补全，支持 `stream: true/false` |
+| `/v1/extension/push`        | POST | 扩展推送 cookies/models（内部使用）    |
+| `/v1/extension/status`      | GET  | 查看扩展连接状态信息                   |
+| `/v1/extension/fetch`       | GET  | 扩展轮询取待转发任务（内部使用）             |
+| `/v1/extension/fetch_chunk` | POST | 扩展回传 SSE 数据块（内部使用）           |
+| `/health`                   | GET  | 健康检查                         |
 
 ## 配置
 
 ### 服务器
 
-| 环境变量 | 默认值 | 说明 |
-|---------|--------|------|
-| `PORT` | `9090` | 服务器监听端口 |
-| `API_KEY` | - | （可选）启用 OpenAI 风格鉴权，要求 `Authorization: Bearer <API_KEY>` |
-| `DEBUG` | - | 设置任意值开启调试日志 |
+| 环境变量      | 默认值    | 说明                                                      |
+| --------- | ------ | ------------------------------------------------------- |
+| `PORT`    | `9090` | 服务器监听端口                                                 |
+| `API_KEY` | -      | （可选）启用 OpenAI 风格鉴权，要求 `Authorization: Bearer <API_KEY>` |
+| `DEBUG`   | -      | 设置任意值开启调试日志                                             |
 
 ### 扩展
 
@@ -210,11 +237,11 @@ for chunk in response:
 
 ### Chrome vs Firefox 差异
 
-| 特性 | Chrome 扩展 | Firefox 扩展 |
-|------|------------|-------------|
-| Manifest 版本 | V3 (Service Worker) | V2 (Background Script) |
-| API 命名空间 | `chrome.*` | `browser.*` (兼容 `chrome.*`) |
-| 目录 | `extension/` | `extension-firefox/` |
+| 特性          | Chrome 扩展           | Firefox 扩展                  |
+| ----------- | ------------------- | --------------------------- |
+| Manifest 版本 | V3 (Service Worker) | V2 (Background Script)      |
+| API 命名空间    | `chrome.*`          | `browser.*` (兼容 `chrome.*`) |
+| 目录          | `extension/`        | `extension-firefox/`        |
 
 ## 项目结构
 
@@ -264,3 +291,27 @@ reCAPTCHA token 有效期约 2 分钟，扩展每 80 秒自动补充。如果短
 - **免费使用** — arena.ai 本身免费，本工具仅做协议格式转换
 - **模型名称** — 使用 arena.ai 原始名称（如 `GPT-4o`、`Claude 3.5 Sonnet`），通过 `/v1/models` 查看完整列表
 - **仅限本地使用** — 服务器默认监听 `0.0.0.0`，生产环境请注意网络安全
+
+在 Claude Code 客户端里，把 API Base URL 设置为你的本地服务：
+
+方法1：环境变量
+
+export ANTHROPIC\_BASE\_URL=<http://localhost:9090/v1>
+export ANTHROPIC\_API\_KEY=any-string
+方法2：\~/.claude/settings.json
+
+{
+"env": {
+"ANTHROPIC\_BASE\_URL": "<http://localhost:9090/v1>",
+"ANTHROPIC\_API\_KEY": "any-string"
+}
+}
+然后在请求时指定模型，比如 claude-sonnet-4-6。
+
+注意：Claude Code 默认用 Anthropic 的 /messages 接口格式，而你的服务是 OpenAI 的 /chat/completions 格式，两者不兼容，直接配置可能无法工作，需要在 server.py 里额外实现 /v1/messages 端点来兼容 Anthropic SDK 格式。
+
+curl -s <http://localhost:9090/v1/messages> \
+-H "Content-Type: application/json" \
+-H "x-api-key: test" \
+-H "anthropic-version: 2023-06-01" \
+-d '{"model":"claude-sonnet-4-6","max\_tokens":1024,"messages":\[{"role":"user","content":"Hello!"}]}' | python3 -m json.tool

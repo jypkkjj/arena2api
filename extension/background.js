@@ -280,6 +280,102 @@
     }
   });
 
+  // ========== 请求转发（扩展代理模式）==========
+  var activeTask = null;
+
+  async function pollAndForward() {
+    if (activeTask) return;
+    if (!state.proxyUrl) return;
+    try {
+      var res = await fetch(state.proxyUrl.replace(/\/+$/, '') + '/v1/extension/fetch');
+      if (!res.ok) return;
+      var task = await res.json();
+      if (!task || !task.task_id) return;
+
+      activeTask = task.task_id;
+      console.log(TAG, 'Forwarding task:', task.task_id, task.url);
+
+      var proxyBase = state.proxyUrl.replace(/\/+$/, '');
+
+      async function sendChunk(chunk, done, error) {
+        await fetch(proxyBase + '/v1/extension/fetch_chunk', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ task_id: task.task_id, chunk: chunk, done: done, error: error }),
+        });
+      }
+
+      try {
+        // 实时获取新 token
+        var freshToken = await new Promise(function(resolve) {
+          if (!state.tabId) { resolve(null); return; }
+          chrome.tabs.sendMessage(state.tabId, { type: 'NEED_TOKEN', action: 'chat_submit' }, function(resp) {
+            if (chrome.runtime.lastError || !resp || !resp.token) { resolve(null); return; }
+            resolve(resp.token);
+          });
+        });
+        var payload = Object.assign({}, task.payload);
+        if (freshToken) {
+          console.log(TAG, 'Using fresh reCAPTCHA token for task:', task.task_id);
+          payload.recaptchaV3Token = freshToken;
+          delete payload.recaptchaV2Token;
+        } else {
+          console.warn(TAG, 'No fresh token, using cached token');
+        }
+
+        var evalId = task.payload && task.payload.id ? task.payload.id : '';
+        var fetchHeaders = {
+          'content-type': 'text/plain;charset=UTF-8',
+          'accept': '*/*',
+          'origin': 'https://arena.ai',
+          'referer': evalId ? 'https://arena.ai/c/' + evalId : 'https://arena.ai/text/direct',
+        };
+        if (state.authToken) {
+          fetchHeaders['authorization'] = 'Bearer ' + state.authToken;
+        }
+        var resp = await fetch(task.url, {
+          method: 'POST',
+          headers: fetchHeaders,
+          body: JSON.stringify(payload),
+        });
+
+        if (!resp.ok) {
+          var errBody = await resp.text();
+          console.error(TAG, 'Arena error:', resp.status, errBody);
+          await sendChunk(null, true, resp.status + ' ' + errBody.substring(0, 200));
+          activeTask = null;
+          return;
+        }
+
+        var reader = resp.body.getReader();
+        var decoder = new TextDecoder();
+        var buffer = '';
+        while (true) {
+          var result = await reader.read();
+          if (result.done) break;
+          buffer += decoder.decode(result.value, { stream: true });
+          var lines = buffer.split('\n');
+          buffer = lines.pop();
+          for (var i = 0; i < lines.length; i++) {
+            if (lines[i].trim()) {
+              await sendChunk(lines[i], false, null);
+            }
+          }
+        }
+        if (buffer.trim()) await sendChunk(buffer, false, null);
+        await sendChunk(null, true, null);
+      } catch(e) {
+        console.error(TAG, 'Forward error:', e);
+        await sendChunk(null, true, e.message || 'fetch failed');
+      }
+      activeTask = null;
+    } catch(e) {
+      activeTask = null;
+    }
+  }
+
+  setInterval(pollAndForward, 500);
+
   // ========== 定时任务 ==========
   // 每 80 秒请求新 token（token 有效期约 2 分钟）
   setInterval(function() {

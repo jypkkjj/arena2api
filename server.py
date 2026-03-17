@@ -22,8 +22,8 @@ import time
 import uuid
 from typing import Optional
 
-import httpx
 import uvicorn
+from curl_cffi.requests import AsyncSession
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.responses import StreamingResponse, JSONResponse
@@ -183,6 +183,76 @@ class Store:
 
 store = Store()
 
+
+# ============================================================
+# 请求队列（扩展转发模式）
+# ============================================================
+class RequestQueue:
+    def __init__(self):
+        self._tasks: dict = {}   # task_id -> {payload, headers, url, event, chunks, done, error}
+
+    def put(self, task_id: str, url: str, payload: dict, headers: dict):
+        event = asyncio.Event()
+        self._tasks[task_id] = {
+            "url": url,
+            "payload": payload,
+            "headers": headers,
+            "event": event,
+            "chunks": [],
+            "done": False,
+            "error": None,
+        }
+
+    def get_pending(self) -> Optional[dict]:
+        """取一个待处理任务（返回给扩展）"""
+        for task_id, task in self._tasks.items():
+            if not task["done"] and task["error"] is None and not task.get("claimed"):
+                task["claimed"] = True
+                return {
+                    "task_id": task_id,
+                    "url": task["url"],
+                    "payload": task["payload"],
+                    "headers": task["headers"],
+                }
+        return None
+
+    def append_chunk(self, task_id: str, chunk: str):
+        task = self._tasks.get(task_id)
+        if task:
+            task["chunks"].append(chunk)
+            task["event"].set()
+
+    def finish(self, task_id: str, error: Optional[str] = None):
+        task = self._tasks.get(task_id)
+        if task:
+            task["done"] = True
+            task["error"] = error
+            task["event"].set()
+
+    async def iter_chunks(self, task_id: str, timeout: float = 300):
+        task = self._tasks.get(task_id)
+        if not task:
+            return
+        idx = 0
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            while idx < len(task["chunks"]):
+                yield task["chunks"][idx]
+                idx += 1
+            if task["done"]:
+                if task["error"]:
+                    raise Exception(task["error"])
+                break
+            task["event"].clear()
+            try:
+                await asyncio.wait_for(task["event"].wait(), timeout=30.0)
+            except asyncio.TimeoutError:
+                pass
+        self._tasks.pop(task_id, None)
+
+
+rq = RequestQueue()
+
 # ============================================================
 # FastAPI
 # ============================================================
@@ -231,6 +301,35 @@ async def extension_push(request: Request):
 @app.get("/v1/extension/status")
 async def extension_status():
     return store.status()
+
+
+@app.get("/v1/extension/fetch")
+async def extension_fetch():
+    """扩展轮询：取一个待处理的请求任务"""
+    task = rq.get_pending()
+    if task:
+        return task
+    return {"task_id": None}
+
+
+@app.post("/v1/extension/fetch_chunk")
+async def extension_fetch_chunk(request: Request):
+    """扩展推送流式数据块"""
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    task_id = data.get("task_id")
+    chunk = data.get("chunk")
+    done = data.get("done", False)
+    error = data.get("error")
+    if not task_id:
+        raise HTTPException(400, "task_id required")
+    if chunk is not None:
+        rq.append_chunk(task_id, chunk)
+    if done or error:
+        rq.finish(task_id, error)
+    return {"ok": True}
 
 
 # ============================================================
@@ -391,13 +490,10 @@ async def chat_completions(request: Request):
     else:
         log.warning("No reCAPTCHA token available, sending without token")
 
-    # 构建 headers
+    # 构建 headers（origin/referer 由浏览器扩展自动附加）
     headers = {
         "accept": "*/*",
         "content-type": "application/json",
-        "origin": ARENA_BASE,
-        "referer": f"{ARENA_BASE}/?mode=direct",
-        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
         "cookie": store.build_cookie_header(),
     }
 
@@ -407,6 +503,8 @@ async def chat_completions(request: Request):
 
     url = ARENA_CREATE_EVAL
     log.info(f"Sending to arena.ai: model={model_name}, eval_id={eval_id}, has_v3={bool(v3_token)}, has_v2={bool(v2_token)}")
+    log.debug(f"Arena payload: {json.dumps({k: (v[:20]+'...' if isinstance(v, str) and len(v)>20 else v) for k, v in arena_payload.items()})}")
+    log.debug(f"Request headers (partial): cookie_len={len(headers.get('cookie',''))}, has_auth={bool(headers.get('authorization'))}")
 
     if stream:
         return StreamingResponse(
@@ -423,131 +521,107 @@ async def chat_completions(request: Request):
 
 
 async def stream_response(url, payload, headers, model_name, eval_id, client_type="openai"):
-    """流式响应生成器"""
+    """流式响应生成器（通过扩展转发）"""
     chat_id = f"chatcmpl-{eval_id}"
     created = int(time.time())
 
+    rq.put(eval_id, url, payload, headers)
+    log.info(f"Task queued for extension: {eval_id}")
+
     try:
-        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-            async with client.stream("POST", url, json=payload, headers=headers) as resp:
-                if resp.status_code != 200:
-                    body = await resp.aread()
-                    log.error(f"Arena API error: {resp.status_code} {body[:500]}")
-                    error_chunk = {
-                        "id": chat_id,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_name,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"content": f"[Error: Arena API returned {resp.status_code}]"},
-                            "finish_reason": "stop",
-                        }],
-                    }
-                    yield f"data: {json.dumps(error_chunk)}\n\n"
-                    yield "data: [DONE]\n\n"
-                    return
+        async for line in rq.iter_chunks(eval_id):
+            if not line.strip():
+                continue
 
-                async for line in resp.aiter_lines():
-                    if not line.strip():
-                        continue
+            content = None
+            reasoning = None
+            finish = None
 
-                    content = None
-                    reasoning = None
-                    finish = None
-
-                    if line.startswith("a0:"):
-                        # 文本内容
-                        try:
-                            content = json.loads(line[3:])
-                            if content == "hasArenaError":
-                                content = "[Arena Error]"
-                                finish = "stop"
-                        except json.JSONDecodeError:
-                            continue
-                    elif line.startswith("ag:"):
-                        # 推理内容
-                        try:
-                            reasoning = json.loads(line[3:])
-                        except json.JSONDecodeError:
-                            continue
-                    elif line.startswith("ad:"):
-                        # 完成
+            if line.startswith("a0:"):
+                try:
+                    content = json.loads(line[3:])
+                    if content == "hasArenaError":
+                        content = "[Arena Error]"
                         finish = "stop"
-                        try:
-                            data = json.loads(line[3:])
-                            if data.get("finishReason"):
-                                finish = data["finishReason"]
-                        except json.JSONDecodeError:
-                            pass
-                    elif line.startswith("a2:"):
-                        # heartbeat 或图片
-                        if "heartbeat" in line:
-                            continue
-                        try:
-                            data = json.loads(line[3:])
-                            images = [img.get("image") for img in data if img.get("image")]
-                            if images:
-                                content = "\n".join(f"![image]({url})" for url in images)
-                        except json.JSONDecodeError:
-                            continue
-                    elif line.startswith("a3:"):
-                        # 错误
-                        try:
-                            content = f"[Error: {json.loads(line[3:])}]"
-                        except:
-                            content = f"[Error: {line[3:]}]"
-                        finish = "stop"
-                    else:
-                        continue
+                except json.JSONDecodeError:
+                    continue
+            elif line.startswith("ag:"):
+                try:
+                    reasoning = json.loads(line[3:])
+                except json.JSONDecodeError:
+                    continue
+            elif line.startswith("ad:"):
+                finish = "stop"
+                try:
+                    data = json.loads(line[3:])
+                    if data.get("finishReason"):
+                        finish = data["finishReason"]
+                except json.JSONDecodeError:
+                    pass
+            elif line.startswith("a2:"):
+                if "heartbeat" in line:
+                    continue
+                try:
+                    data = json.loads(line[3:])
+                    images = [img.get("image") for img in data if img.get("image")]
+                    if images:
+                        content = "\n".join(f"![image]({img_url})" for img_url in images)
+                except json.JSONDecodeError:
+                    continue
+            elif line.startswith("a3:"):
+                try:
+                    content = f"[Error: {json.loads(line[3:])}]"
+                except Exception:
+                    content = f"[Error: {line[3:]}]"
+                finish = "stop"
+            else:
+                continue
 
-                    if content is not None:
-                        chunk = {
-                            "id": chat_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_name,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"content": content},
-                                "finish_reason": None,
-                            }],
-                        }
-                        # Claude/Anthropic 格式兼容
-                        if client_type == "claude":
-                            chunk["type"] = "content_block_delta"
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            if content is not None:
+                chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"content": content},
+                        "finish_reason": None,
+                    }],
+                }
+                if client_type == "claude":
+                    chunk["type"] = "content_block_delta"
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
-                    if reasoning is not None:
-                        # 将推理内容作为普通内容输出（或可以用 reasoning_content）
-                        chunk = {
-                            "id": chat_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_name,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {"reasoning_content": reasoning},
-                                "finish_reason": None,
-                            }],
-                        }
-                        yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+            if reasoning is not None:
+                chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"reasoning_content": reasoning},
+                        "finish_reason": None,
+                    }],
+                }
+                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
 
-                    if finish:
-                        chunk = {
-                            "id": chat_id,
-                            "object": "chat.completion.chunk",
-                            "created": created,
-                            "model": model_name,
-                            "choices": [{
-                                "index": 0,
-                                "delta": {},
-                                "finish_reason": finish if finish != "stop" else "stop",
-                            }],
-                        }
-                        yield f"data: {json.dumps(chunk)}\n\n"
-                        yield "data: [DONE]\n\n"
-                        return
+            if finish:
+                chunk = {
+                    "id": chat_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model_name,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": finish,
+                    }],
+                }
+                yield f"data: {json.dumps(chunk)}\n\n"
+                yield "data: [DONE]\n\n"
+                return
 
     except Exception as e:
         log.error(f"Stream error: {e}")
@@ -567,64 +641,58 @@ async def stream_response(url, payload, headers, model_name, eval_id, client_typ
 
 
 async def non_stream_response(url, payload, headers, model_name, eval_id, client_type="openai"):
-    """非流式响应"""
+    """非流式响应（通过扩展转发）"""
     content_parts = []
     reasoning_parts = []
     finish_reason = "stop"
     usage = {}
 
+    rq.put(eval_id, url, payload, headers)
+    log.info(f"Task queued for extension (non-stream): {eval_id}")
+
     try:
-        async with httpx.AsyncClient(timeout=300, follow_redirects=True) as client:
-            async with client.stream("POST", url, json=payload, headers=headers) as resp:
-                if resp.status_code != 200:
-                    body = await resp.aread()
-                    log.error(f"Arena API error: {resp.status_code} {body[:500]}")
-                    raise HTTPException(resp.status_code, f"Arena API error: {body[:200]}")
+        async for line in rq.iter_chunks(eval_id):
+            if not line.strip():
+                continue
+            if line.startswith("a0:"):
+                try:
+                    text = json.loads(line[3:])
+                    if isinstance(text, str) and text != "hasArenaError":
+                        content_parts.append(text)
+                except json.JSONDecodeError:
+                    pass
+            elif line.startswith("ag:"):
+                try:
+                    text = json.loads(line[3:])
+                    if isinstance(text, str):
+                        reasoning_parts.append(text)
+                except json.JSONDecodeError:
+                    pass
+            elif line.startswith("ad:"):
+                try:
+                    data = json.loads(line[3:])
+                    if data.get("finishReason"):
+                        finish_reason = data["finishReason"]
+                    if data.get("usage"):
+                        usage = data["usage"]
+                except json.JSONDecodeError:
+                    pass
+            elif line.startswith("a2:"):
+                if "heartbeat" in line:
+                    continue
+                try:
+                    data = json.loads(line[3:])
+                    images = [img.get("image") for img in data if img.get("image")]
+                    for img_url in images:
+                        content_parts.append(f"![image]({img_url})")
+                except json.JSONDecodeError:
+                    pass
+            elif line.startswith("a3:"):
+                try:
+                    content_parts.append(f"[Error: {json.loads(line[3:])}]")
+                except Exception:
+                    content_parts.append(f"[Error: {line[3:]}]")
 
-                async for line in resp.aiter_lines():
-                    if not line.strip():
-                        continue
-                    if line.startswith("a0:"):
-                        try:
-                            text = json.loads(line[3:])
-                            if isinstance(text, str) and text != "hasArenaError":
-                                content_parts.append(text)
-                        except json.JSONDecodeError:
-                            pass
-                    elif line.startswith("ag:"):
-                        try:
-                            text = json.loads(line[3:])
-                            if isinstance(text, str):
-                                reasoning_parts.append(text)
-                        except json.JSONDecodeError:
-                            pass
-                    elif line.startswith("ad:"):
-                        try:
-                            data = json.loads(line[3:])
-                            if data.get("finishReason"):
-                                finish_reason = data["finishReason"]
-                            if data.get("usage"):
-                                usage = data["usage"]
-                        except json.JSONDecodeError:
-                            pass
-                    elif line.startswith("a2:"):
-                        if "heartbeat" in line:
-                            continue
-                        try:
-                            data = json.loads(line[3:])
-                            images = [img.get("image") for img in data if img.get("image")]
-                            for img_url in images:
-                                content_parts.append(f"![image]({img_url})")
-                        except json.JSONDecodeError:
-                            pass
-                    elif line.startswith("a3:"):
-                        try:
-                            content_parts.append(f"[Error: {json.loads(line[3:])}]")
-                        except:
-                            content_parts.append(f"[Error: {line[3:]}]")
-
-    except HTTPException:
-        raise
     except Exception as e:
         log.error(f"Non-stream error: {e}")
         raise HTTPException(500, str(e))
@@ -660,6 +728,196 @@ async def non_stream_response(url, payload, headers, model_name, eval_id, client
         response["content"] = [{"type": "text", "text": full_content}]
 
     return response
+
+
+# ============================================================
+# Anthropic 兼容端点
+# ============================================================
+@app.post("/v1/messages")
+async def anthropic_messages(request: Request):
+    """Anthropic Messages API 兼容端点"""
+    verify_api_key(request)
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+
+    # 转换 Anthropic 格式到内部格式
+    model_name = body.get("model", "")
+    stream = body.get("stream", False)
+    max_tokens = body.get("max_tokens", 1024)
+
+    # Anthropic messages 格式转换
+    messages = []
+    system = body.get("system", "")
+    if system:
+        if isinstance(system, list):
+            system = "\n".join(s.get("text", "") for s in system if s.get("type") == "text")
+        messages.append({"role": "system", "content": system})
+
+    for msg in body.get("messages", []):
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            text_parts = []
+            for block in content:
+                if block.get("type") == "text":
+                    text_parts.append(block.get("text", ""))
+            content = "\n".join(text_parts)
+        messages.append({"role": role, "content": content})
+
+    if not messages:
+        raise HTTPException(400, "messages is required")
+
+    if not store.active:
+        raise HTTPException(503, "Extension not connected.")
+
+    model_id = store.text_models.get(model_name) or store.image_models.get(model_name)
+    if not model_id:
+        for name, mid in {**store.text_models, **store.image_models}.items():
+            if model_name.lower() in name.lower() or name.lower() in model_name.lower():
+                model_id = mid
+                model_name = name
+                break
+    if not model_id:
+        raise HTTPException(404, f"Model '{model_name}' not found")
+
+    # 构建 prompt
+    prompt = ""
+    for msg in reversed(messages):
+        if msg.get("role") == "user":
+            prompt = msg.get("content", "")
+            break
+    if len(messages) > 1:
+        history_parts = []
+        for msg in messages:
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "system":
+                continue
+            history_parts.append(f"<|{role}|>\n{content}")
+        prompt = "\n".join(history_parts)
+    system_parts = [m["content"] for m in messages if m.get("role") == "system"]
+    if system_parts:
+        prompt = "\n".join(system_parts) + "\n\n" + prompt
+
+    v3_token = store.pop_v3_token()
+    v2_token = store.pop_v2_token() if not v3_token else None
+    eval_id = uuid7()
+    user_msg_id = uuid7()
+    model_a_msg_id = uuid7()
+
+    arena_payload = {
+        "id": eval_id,
+        "mode": "direct",
+        "modelAId": model_id,
+        "userMessageId": user_msg_id,
+        "modelAMessageId": model_a_msg_id,
+        "userMessage": {"content": prompt, "experimental_attachments": [], "metadata": {}},
+        "modality": "chat",
+    }
+    if v2_token:
+        arena_payload["recaptchaV2Token"] = v2_token
+        arena_payload["recaptchaV3Token"] = None
+    elif v3_token:
+        arena_payload["recaptchaV3Token"] = v3_token
+
+    headers = {
+        "accept": "*/*",
+        "content-type": "application/json",
+        "cookie": store.build_cookie_header(),
+    }
+    if store.auth_token:
+        headers["authorization"] = f"Bearer {store.auth_token}"
+
+    if stream:
+        return StreamingResponse(
+            anthropic_stream_response(ARENA_CREATE_EVAL, arena_payload, headers, model_name, eval_id),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+    else:
+        return await anthropic_non_stream_response(ARENA_CREATE_EVAL, arena_payload, headers, model_name, eval_id)
+
+
+async def anthropic_stream_response(url, payload, headers, model_name, eval_id):
+    """Anthropic SSE 格式流式响应"""
+    msg_id = f"msg_{eval_id.replace('-', '')[:24]}"
+    created = int(time.time())
+
+    # message_start
+    yield f"event: message_start\ndata: {json.dumps({'type':'message_start','message':{'id':msg_id,'type':'message','role':'assistant','content':[],'model':model_name,'stop_reason':None,'stop_sequence':None,'usage':{'input_tokens':0,'output_tokens':0}}})}\n\n"
+    yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n"
+    yield "event: ping\ndata: {\"type\":\"ping\"}\n\n"
+
+    rq.put(eval_id, url, payload, headers)
+
+    stop_reason = "end_turn"
+    try:
+        async for line in rq.iter_chunks(eval_id):
+            if not line.strip():
+                continue
+            if line.startswith("a0:"):
+                try:
+                    text = json.loads(line[3:])
+                    if isinstance(text, str) and text != "hasArenaError":
+                        yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':text}})}\n\n"
+                except json.JSONDecodeError:
+                    pass
+            elif line.startswith("ad:"):
+                try:
+                    data = json.loads(line[3:])
+                    if data.get("finishReason"):
+                        stop_reason = data["finishReason"]
+                except json.JSONDecodeError:
+                    pass
+    except Exception as e:
+        log.error(f"Anthropic stream error: {e}")
+
+    yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
+    yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':stop_reason,'stop_sequence':None},'usage':{'output_tokens':0}})}\n\n"
+    yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
+
+
+async def anthropic_non_stream_response(url, payload, headers, model_name, eval_id):
+    """Anthropic 非流式响应"""
+    content_parts = []
+    stop_reason = "end_turn"
+    msg_id = f"msg_{eval_id.replace('-', '')[:24]}"
+
+    rq.put(eval_id, url, payload, headers)
+    try:
+        async for line in rq.iter_chunks(eval_id):
+            if not line.strip():
+                continue
+            if line.startswith("a0:"):
+                try:
+                    text = json.loads(line[3:])
+                    if isinstance(text, str) and text != "hasArenaError":
+                        content_parts.append(text)
+                except json.JSONDecodeError:
+                    pass
+            elif line.startswith("ad:"):
+                try:
+                    data = json.loads(line[3:])
+                    if data.get("finishReason"):
+                        stop_reason = data["finishReason"]
+                except json.JSONDecodeError:
+                    pass
+    except Exception as e:
+        log.error(f"Anthropic non-stream error: {e}")
+        raise HTTPException(500, str(e))
+
+    return {
+        "id": msg_id,
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": "".join(content_parts)}],
+        "model": model_name,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    }
 
 
 # ============================================================
